@@ -182,6 +182,118 @@ server.tool(
   }
 );
 
+server.tool(
+  "get_campaign_link_performance",
+  "Get per-URL click performance for a campaign. Exports individual click events and aggregates them " +
+    "by URL to produce a ranked list of most-clicked links. Returns total clicks and unique clicks per URL. " +
+    "This is the programmatic equivalent of the 'Link Performance' tab in the Iterable UI. " +
+    "Rate limited — the export API has aggressive rate limiting, space requests 10-15 seconds apart. " +
+    "For campaigns with many clicks, this may return a large amount of data.",
+  {
+    campaign_id: z.number().describe("The campaign ID to get link performance for."),
+    start_date: z
+      .string()
+      .describe(
+        "Start datetime in ISO 8601 format (e.g. '2026-05-22T00:00:00'). " +
+          "Should cover the campaign's send date."
+      ),
+    end_date: z
+      .string()
+      .describe(
+        "End datetime in ISO 8601 format (e.g. '2026-05-23T00:00:00'). " +
+          "Should be at least 1-2 days after the campaign send date to capture delayed clicks."
+      ),
+    exclude_bots: z
+      .boolean()
+      .optional()
+      .describe("Exclude bot clicks from the results. Defaults to true."),
+  },
+  async ({ campaign_id, start_date, end_date, exclude_bots }) => {
+    const shouldExcludeBots = exclude_bots !== false;
+
+    const params = new URLSearchParams();
+    params.append("dataTypeName", "emailClick");
+    params.append("startDateTime", `${start_date}.000Z`);
+    params.append("endDateTime", `${end_date}.000Z`);
+    params.append("campaignId", campaign_id.toString());
+
+    const response = await iterableRequest(
+      `/export/data.json?${params.toString()}`
+    );
+    const text = await response.text();
+    const lines = text.trim().split("\n").filter(Boolean);
+
+    const urlStats = new Map<
+      string,
+      { total_clicks: number; unique_emails: Set<string> }
+    >();
+    let processedCount = 0;
+
+    for (const line of lines) {
+      const event = JSON.parse(line) as {
+        url?: string;
+        email?: string;
+        isBot?: boolean;
+        "trackedLink.templateUrl"?: string;
+      };
+
+      if (shouldExcludeBots && event.isBot) continue;
+      processedCount++;
+
+      const templateUrl =
+        event["trackedLink.templateUrl"] ?? event.url ?? "unknown";
+      // Strip UTM params to group by base URL
+      let baseUrl: string;
+      try {
+        const parsed = new URL(templateUrl);
+        parsed.searchParams.delete("utm_source");
+        parsed.searchParams.delete("utm_medium");
+        parsed.searchParams.delete("utm_campaign");
+        baseUrl = parsed.toString();
+      } catch {
+        baseUrl = templateUrl;
+      }
+
+      const existing = urlStats.get(baseUrl);
+      if (existing) {
+        existing.total_clicks++;
+        if (event.email) existing.unique_emails.add(event.email);
+      } else {
+        const emails = new Set<string>();
+        if (event.email) emails.add(event.email);
+        urlStats.set(baseUrl, { total_clicks: 1, unique_emails: emails });
+      }
+    }
+
+    const ranked = Array.from(urlStats.entries())
+      .map(([url, stats]) => ({
+        url,
+        total_clicks: stats.total_clicks,
+        unique_clicks: stats.unique_emails.size,
+      }))
+      .sort((a, b) => b.total_clicks - a.total_clicks);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              campaign_id,
+              total_click_events: processedCount,
+              bots_excluded: shouldExcludeBots,
+              unique_urls: ranked.length,
+              links: ranked,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
 // ─── List Tools ─────────────────────────────────────────────────────────────
 
 server.tool(
