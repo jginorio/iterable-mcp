@@ -1,0 +1,44 @@
+{
+  "name": "iterable-mcp",
+  "version": "1.0.0",
+  "description": "Unofficial community MCP server for the Iterable API — use it while Iterable works on their official one. Provides tools for email campaign analytics, subscriber lists, user data, and more.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "iterable-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "iterable",
+    "email-marketing",
+    "campaigns",
+    "analytics",
+    "ai",
+    "llm"
+  ],
+  "author": "Platea",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}
