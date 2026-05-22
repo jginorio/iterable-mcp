@@ -25,6 +25,10 @@
   ],
   "author": "Platea",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jginorio/iterable-mcp"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^3.23.0"
