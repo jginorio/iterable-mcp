@@ -1,6 +1,6 @@
 # Iterable MCP Server
 
-> **Note:** This is an unofficial, community-built MCP server to use while Iterable works on releasing their official one.
+> **Note:** This is an unofficial, community-built MCP server. While Iterable has an official MCP server, our team ran into several issues with it, so we built this one tailored to our specific use cases.
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for the [Iterable API](https://api.iterable.com/api/docs). It lets AI assistants (Claude, Cursor, Devin, etc.) access your Iterable data — campaign analytics, subscriber lists, user profiles, templates, and more — through a standardized interface.
 
