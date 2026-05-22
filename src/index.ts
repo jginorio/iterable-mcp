@@ -227,6 +227,7 @@ server.tool(
       string,
       { total_clicks: number; unique_emails: Set<string> }
     >();
+    let processedCount = 0;
 
     for (const line of lines) {
       const event = JSON.parse(line) as {
@@ -237,6 +238,7 @@ server.tool(
       };
 
       if (shouldExcludeBots && event.isBot) continue;
+      processedCount++;
 
       const templateUrl =
         event["trackedLink.templateUrl"] ?? event.url ?? "unknown";
@@ -278,7 +280,7 @@ server.tool(
           text: JSON.stringify(
             {
               campaign_id,
-              total_click_events: lines.length,
+              total_click_events: processedCount,
               bots_excluded: shouldExcludeBots,
               unique_urls: ranked.length,
               links: ranked,
