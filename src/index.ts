@@ -294,6 +294,213 @@ server.tool(
   }
 );
 
+server.tool(
+  "get_campaign_openers",
+  "Get the list of unique email addresses that opened a specific campaign. " +
+    "Uses the Iterable data export API to pull all emailOpen events for the campaign, " +
+    "then deduplicates by email. Returns openers with open counts, and optionally " +
+    "cross-references against a provided list of emails to identify matches (e.g. from Asana). " +
+    "Rate limited — space requests 10-15 seconds apart.",
+  {
+    campaign_id: z.number().describe("The campaign ID to get openers for."),
+    start_date: z
+      .string()
+      .describe(
+        "Start datetime in ISO 8601 format (e.g. '2026-05-01T00:00:00'). " +
+          "Should be on or before the campaign send date."
+      ),
+    end_date: z
+      .string()
+      .describe(
+        "End datetime in ISO 8601 format (e.g. '2026-06-30T00:00:00'). " +
+          "Should be after the campaign send date to capture delayed opens."
+      ),
+    match_emails: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Optional list of email addresses to cross-reference (e.g. from Asana contacts). " +
+          "If provided, the response will include which of these emails opened the campaign."
+      ),
+    exclude_bots: z
+      .boolean()
+      .optional()
+      .describe("Exclude bot opens from the results. Defaults to true."),
+  },
+  async ({ campaign_id, start_date, end_date, match_emails, exclude_bots }) => {
+    const shouldExcludeBots = exclude_bots !== false;
+
+    const params = new URLSearchParams();
+    params.append("dataTypeName", "emailOpen");
+    params.append("startDateTime", `${start_date}.000Z`);
+    params.append("endDateTime", `${end_date}.000Z`);
+    params.append("campaignId", campaign_id.toString());
+
+    const response = await iterableRequest(
+      `/export/data.json?${params.toString()}`
+    );
+    const text = await response.text();
+    const lines = text.trim().split("\n").filter(Boolean);
+
+    const openerMap = new Map<string, { open_count: number; first_open: string; last_open: string }>();
+
+    for (const line of lines) {
+      const event = JSON.parse(line) as {
+        email?: string;
+        isBot?: boolean;
+        createdAt?: string;
+      };
+
+      if (shouldExcludeBots && event.isBot) continue;
+      if (!event.email) continue;
+
+      const email = event.email.toLowerCase();
+      const existing = openerMap.get(email);
+      if (existing) {
+        existing.open_count++;
+        if (event.createdAt && event.createdAt > existing.last_open) {
+          existing.last_open = event.createdAt;
+        }
+        if (event.createdAt && event.createdAt < existing.first_open) {
+          existing.first_open = event.createdAt;
+        }
+      } else {
+        openerMap.set(email, {
+          open_count: 1,
+          first_open: event.createdAt ?? "",
+          last_open: event.createdAt ?? "",
+        });
+      }
+    }
+
+    const openers = Array.from(openerMap.entries()).map(([email, stats]) => ({
+      email,
+      ...stats,
+    }));
+
+    const result: Record<string, unknown> = {
+      campaign_id,
+      total_open_events: lines.length,
+      unique_openers: openers.length,
+      bots_excluded: shouldExcludeBots,
+      openers,
+    };
+
+    if (match_emails && match_emails.length > 0) {
+      const openerEmails = new Set(openers.map((o) => o.email));
+      const normalizedMatch = match_emails.map((e) => e.toLowerCase());
+      const matched = normalizedMatch.filter((e) => openerEmails.has(e));
+      const not_matched = normalizedMatch.filter((e) => !openerEmails.has(e));
+      result.match_summary = {
+        provided: match_emails.length,
+        opened: matched.length,
+        not_opened: not_matched.length,
+        opened_emails: matched,
+        not_opened_emails: not_matched,
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "get_campaign_sends",
+  "Get the list of unique email addresses that were sent a specific campaign. " +
+    "Uses the Iterable data export API to pull all emailSend events for the campaign. " +
+    "Optionally cross-references against a provided list of emails to identify which contacts " +
+    "received the campaign (e.g. to verify Asana contacts were actually sent the email). " +
+    "Rate limited — space requests 10-15 seconds apart.",
+  {
+    campaign_id: z.number().describe("The campaign ID to get send recipients for."),
+    start_date: z
+      .string()
+      .describe(
+        "Start datetime in ISO 8601 format (e.g. '2026-05-01T00:00:00'). " +
+          "Should be on or before the campaign send date."
+      ),
+    end_date: z
+      .string()
+      .describe(
+        "End datetime in ISO 8601 format (e.g. '2026-06-30T00:00:00'). " +
+          "Should be after the campaign send date."
+      ),
+    match_emails: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Optional list of email addresses to cross-reference (e.g. from Asana contacts). " +
+          "If provided, the response will include which of these emails received the campaign."
+      ),
+  },
+  async ({ campaign_id, start_date, end_date, match_emails }) => {
+    const params = new URLSearchParams();
+    params.append("dataTypeName", "emailSend");
+    params.append("startDateTime", `${start_date}.000Z`);
+    params.append("endDateTime", `${end_date}.000Z`);
+    params.append("campaignId", campaign_id.toString());
+
+    const response = await iterableRequest(
+      `/export/data.json?${params.toString()}`
+    );
+    const text = await response.text();
+    const lines = text.trim().split("\n").filter(Boolean);
+
+    const recipientMap = new Map<string, { send_count: number; sent_at: string }>();
+
+    for (const line of lines) {
+      const event = JSON.parse(line) as {
+        email?: string;
+        createdAt?: string;
+      };
+
+      if (!event.email) continue;
+      const email = event.email.toLowerCase();
+      const existing = recipientMap.get(email);
+      if (existing) {
+        existing.send_count++;
+      } else {
+        recipientMap.set(email, {
+          send_count: 1,
+          sent_at: event.createdAt ?? "",
+        });
+      }
+    }
+
+    const recipients = Array.from(recipientMap.entries()).map(([email, stats]) => ({
+      email,
+      ...stats,
+    }));
+
+    const result: Record<string, unknown> = {
+      campaign_id,
+      total_send_events: lines.length,
+      unique_recipients: recipients.length,
+      recipients,
+    };
+
+    if (match_emails && match_emails.length > 0) {
+      const recipientEmails = new Set(recipients.map((r) => r.email));
+      const normalizedMatch = match_emails.map((e) => e.toLowerCase());
+      const matched = normalizedMatch.filter((e) => recipientEmails.has(e));
+      const not_matched = normalizedMatch.filter((e) => !recipientEmails.has(e));
+      result.match_summary = {
+        provided: match_emails.length,
+        sent: matched.length,
+        not_sent: not_matched.length,
+        sent_emails: matched,
+        not_sent_emails: not_matched,
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    };
+  }
+);
+
 // ─── List Tools ─────────────────────────────────────────────────────────────
 
 server.tool(
