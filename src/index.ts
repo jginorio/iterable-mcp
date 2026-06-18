@@ -62,6 +62,27 @@ async function iterableText(path: string): Promise<string> {
   return response.text();
 }
 
+/**
+ * Normalizes Iterable's `transactionalData`, which may arrive either as a JSON
+ * string or as an already-parsed object depending on the export. Returns the
+ * parsed object, or undefined if it's absent or can't be interpreted.
+ */
+function parseTransactionalData(
+  value: string | Record<string, unknown> | undefined | null
+): Record<string, unknown> | undefined {
+  if (value == null) return undefined;
+  if (typeof value === "object") return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function parseCsv(csv: string): Record<string, string>[] {
   const lines = csv.trim().split("\n");
   if (lines.length < 2) return [];
@@ -296,10 +317,11 @@ server.tool(
 
 server.tool(
   "get_campaign_openers",
-  "Get the list of unique email addresses that opened a specific campaign. " +
-    "Uses the Iterable data export API to pull all emailOpen events for the campaign, " +
-    "then deduplicates by email. Returns openers with open counts, and optionally " +
-    "cross-references against a provided list of emails to identify matches (e.g. from Asana). " +
+  "Get which contacts opened a campaign, matched to Asana task IDs via messageId join. " +
+    "Step 1: fetches emailSend events to build a messageId → asana_task_id + email map (from transactionalData). " +
+    "Step 2: fetches emailOpen events and joins on messageId to determine who opened. " +
+    "Returns per-contact open status with asana_task_id, email, business_name, and open details. " +
+    "Falls back to email-only matching if transactionalData is not present. " +
     "Rate limited — space requests 10-15 seconds apart.",
   {
     campaign_id: z.number().describe("The campaign ID to get openers for."),
@@ -315,38 +337,82 @@ server.tool(
         "End datetime in ISO 8601 format (e.g. '2026-06-30T00:00:00'). " +
           "Should be after the campaign send date to capture delayed opens."
       ),
-    match_emails: z
-      .array(z.string())
-      .optional()
-      .describe(
-        "Optional list of email addresses to cross-reference (e.g. from Asana contacts). " +
-          "If provided, the response will include which of these emails opened the campaign."
-      ),
     exclude_bots: z
       .boolean()
       .optional()
       .describe("Exclude bot opens from the results. Defaults to true."),
   },
-  async ({ campaign_id, start_date, end_date, match_emails, exclude_bots }) => {
+  async ({ campaign_id, start_date, end_date, exclude_bots }) => {
     const shouldExcludeBots = exclude_bots !== false;
+    const commonParams = `&startDateTime=${start_date}.000Z&endDateTime=${end_date}.000Z&campaignId=${campaign_id}`;
 
-    const params = new URLSearchParams();
-    params.append("dataTypeName", "emailOpen");
-    params.append("startDateTime", `${start_date}.000Z`);
-    params.append("endDateTime", `${end_date}.000Z`);
-    params.append("campaignId", campaign_id.toString());
-
-    const response = await iterableRequest(
-      `/export/data.json?${params.toString()}`
+    // Step 1: fetch emailSend events → build messageId → contact map
+    const sendResponse = await iterableRequest(
+      `/export/data.json?dataTypeName=emailSend${commonParams}`
     );
-    const text = await response.text();
-    const lines = text.trim().split("\n").filter(Boolean);
+    const sendText = await sendResponse.text();
+    const sendLines = sendText.trim().split("\n").filter(Boolean);
 
-    const openerMap = new Map<string, { open_count: number; first_open: string; last_open: string }>();
+    type ContactInfo = {
+      email: string;
+      asana_task_id?: string;
+      business_name?: string;
+      client_name?: string;
+    };
 
-    for (const line of lines) {
+    const messageToContact = new Map<string, ContactInfo>();
+    // Secondary index so opens can still be joined to a sent contact by email
+    // when their messageId is missing or doesn't match a send event. This keeps
+    // the join key (asana_task_id ?? email) consistent between Step 2 and Step 3.
+    const emailToContact = new Map<string, ContactInfo>();
+
+    // Derives the canonical join key for a contact, used by both the opener
+    // map (Step 2) and the per-contact results (Step 3) so they always agree.
+    const contactKey = (c: ContactInfo) => c.asana_task_id ?? c.email;
+
+    for (const line of sendLines) {
       const event = JSON.parse(line) as {
         email?: string;
+        messageId?: string;
+        // Iterable may serialize this as a JSON string or return it already
+        // parsed as an object, depending on the export, so accept both.
+        transactionalData?: string | Record<string, unknown>;
+      };
+      if (!event.messageId || !event.email) continue;
+
+      const contact: ContactInfo = { email: event.email.toLowerCase() };
+
+      const td = parseTransactionalData(event.transactionalData);
+      if (td) {
+        if (typeof td.asana_task_id === "string") contact.asana_task_id = td.asana_task_id;
+        if (typeof td.business_name === "string") contact.business_name = td.business_name;
+        if (typeof td.client_name === "string") contact.client_name = td.client_name;
+      }
+
+      messageToContact.set(event.messageId, contact);
+      emailToContact.set(contact.email, contact);
+    }
+
+    // Step 2: fetch emailOpen events → join on messageId
+    const openResponse = await iterableRequest(
+      `/export/data.json?dataTypeName=emailOpen${commonParams}`
+    );
+    const openText = await openResponse.text();
+    const openLines = openText.trim().split("\n").filter(Boolean);
+
+    type OpenerStats = ContactInfo & {
+      open_count: number;
+      first_open: string;
+      last_open: string;
+    };
+
+    // Key by asana_task_id if available, else email
+    const openerMap = new Map<string, OpenerStats>();
+
+    for (const line of openLines) {
+      const event = JSON.parse(line) as {
+        email?: string;
+        messageId?: string;
         isBot?: boolean;
         createdAt?: string;
       };
@@ -354,18 +420,28 @@ server.tool(
       if (shouldExcludeBots && event.isBot) continue;
       if (!event.email) continue;
 
-      const email = event.email.toLowerCase();
-      const existing = openerMap.get(email);
+      // Prefer the messageId join, but fall back to matching the open's email
+      // against the sent contacts so we resolve the same asana_task_id-keyed
+      // contact that Step 3 will look up (avoids missing opens for contacts
+      // with an asana_task_id whose open event has a missing/unmatched messageId).
+      const emailLower = event.email.toLowerCase();
+      const contact =
+        (event.messageId ? messageToContact.get(event.messageId) : undefined) ??
+        emailToContact.get(emailLower);
+
+      const key = contact ? contactKey(contact) : emailLower;
+      const existing = openerMap.get(key);
+
       if (existing) {
         existing.open_count++;
-        if (event.createdAt && event.createdAt > existing.last_open) {
-          existing.last_open = event.createdAt;
-        }
-        if (event.createdAt && event.createdAt < existing.first_open) {
-          existing.first_open = event.createdAt;
-        }
+        if (event.createdAt && event.createdAt > existing.last_open) existing.last_open = event.createdAt;
+        if (event.createdAt && event.createdAt < existing.first_open) existing.first_open = event.createdAt;
       } else {
-        openerMap.set(email, {
+        openerMap.set(key, {
+          email: contact?.email ?? event.email.toLowerCase(),
+          asana_task_id: contact?.asana_task_id,
+          business_name: contact?.business_name,
+          client_name: contact?.client_name,
           open_count: 1,
           first_open: event.createdAt ?? "",
           last_open: event.createdAt ?? "",
@@ -373,35 +449,106 @@ server.tool(
       }
     }
 
-    const openers = Array.from(openerMap.entries()).map(([email, stats]) => ({
-      email,
-      ...stats,
-    }));
-
-    const result: Record<string, unknown> = {
-      campaign_id,
-      total_open_events: lines.length,
-      unique_openers: openers.length,
-      bots_excluded: shouldExcludeBots,
-      openers,
-    };
-
-    if (match_emails && match_emails.length > 0) {
-      const openerEmails = new Set(openers.map((o) => o.email));
-      const normalizedMatch = match_emails.map((e) => e.toLowerCase());
-      const matched = normalizedMatch.filter((e) => openerEmails.has(e));
-      const not_matched = normalizedMatch.filter((e) => !openerEmails.has(e));
-      result.match_summary = {
-        provided: match_emails.length,
-        opened: matched.length,
-        not_opened: not_matched.length,
-        opened_emails: matched,
-        not_opened_emails: not_matched,
-      };
+    // Step 3: build full list of all sent contacts with opened flag
+    const allContacts = Array.from(messageToContact.values());
+    // Deduplicate by asana_task_id or email
+    const seen = new Set<string>();
+    const uniqueContacts: ContactInfo[] = [];
+    for (const c of allContacts) {
+      const key = contactKey(c);
+      if (!seen.has(key)) { seen.add(key); uniqueContacts.push(c); }
     }
 
+    const results = uniqueContacts.map((c) => {
+      const openStats = openerMap.get(contactKey(c));
+      return {
+        asana_task_id: c.asana_task_id ?? null,
+        email: c.email,
+        business_name: c.business_name ?? null,
+        client_name: c.client_name ?? null,
+        opened: !!openStats,
+        open_count: openStats?.open_count ?? 0,
+        first_open: openStats?.first_open ?? null,
+        last_open: openStats?.last_open ?? null,
+      };
+    }).sort((a, b) => (b.opened ? 1 : 0) - (a.opened ? 1 : 0));
+
+    const opened = results.filter((r) => r.opened);
+    const not_opened = results.filter((r) => !r.opened);
+
     return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          campaign_id,
+          total_sent: uniqueContacts.length,
+          total_opened: opened.length,
+          total_not_opened: not_opened.length,
+          open_rate: uniqueContacts.length > 0
+            ? `${((opened.length / uniqueContacts.length) * 100).toFixed(1)}%`
+            : "0%",
+          bots_excluded: shouldExcludeBots,
+          opened,
+          not_opened,
+        }, null, 2),
+      }],
+    };
+  }
+);
+
+server.tool(
+  "inspect_campaign_event_fields",
+  "Inspect the raw fields available on emailOpen or emailSend events for a campaign. " +
+    "Returns all fields from the first N events so you can discover what data is attached " +
+    "(e.g. dataFields, custom attributes like Asana task IDs, userId, etc.). " +
+    "Use this before building a cross-reference to know exactly which field holds the identifier.",
+  {
+    campaign_id: z.number().describe("The campaign ID to inspect events for."),
+    start_date: z.string().describe("Start datetime in ISO 8601 format (e.g. '2026-05-01T00:00:00')."),
+    end_date: z.string().describe("End datetime in ISO 8601 format (e.g. '2026-06-30T00:00:00')."),
+    event_type: z
+      .enum(["emailOpen", "emailSend", "emailClick"])
+      .optional()
+      .describe("Event type to inspect. Defaults to 'emailOpen'."),
+    sample_size: z
+      .number()
+      .optional()
+      .describe("Number of raw events to return for inspection. Defaults to 3."),
+  },
+  async ({ campaign_id, start_date, end_date, event_type, sample_size }) => {
+    const dataTypeName = event_type ?? "emailOpen";
+    const limit = sample_size ?? 3;
+
+    const params = new URLSearchParams();
+    params.append("dataTypeName", dataTypeName);
+    params.append("startDateTime", `${start_date}.000Z`);
+    params.append("endDateTime", `${end_date}.000Z`);
+    params.append("campaignId", campaign_id.toString());
+
+    const response = await iterableRequest(`/export/data.json?${params.toString()}`);
+    const text = await response.text();
+    const lines = text.trim().split("\n").filter(Boolean).slice(0, limit);
+
+    const events = lines.map((line) => JSON.parse(line));
+    const allKeys = Array.from(new Set(events.flatMap((e) => Object.keys(e)))).sort();
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              campaign_id,
+              event_type: dataTypeName,
+              sample_count: events.length,
+              available_fields: allKeys,
+              sample_events: events,
+            },
+            null,
+            2
+          ),
+        },
+      ],
     };
   }
 );
