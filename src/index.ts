@@ -62,6 +62,27 @@ async function iterableText(path: string): Promise<string> {
   return response.text();
 }
 
+/**
+ * Normalizes Iterable's `transactionalData`, which may arrive either as a JSON
+ * string or as an already-parsed object depending on the export. Returns the
+ * parsed object, or undefined if it's absent or can't be interpreted.
+ */
+function parseTransactionalData(
+  value: string | Record<string, unknown> | undefined | null
+): Record<string, unknown> | undefined {
+  if (value == null) return undefined;
+  if (typeof value === "object") return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function parseCsv(csv: string): Record<string, string>[] {
   const lines = csv.trim().split("\n");
   if (lines.length < 2) return [];
@@ -340,27 +361,36 @@ server.tool(
     };
 
     const messageToContact = new Map<string, ContactInfo>();
+    // Secondary index so opens can still be joined to a sent contact by email
+    // when their messageId is missing or doesn't match a send event. This keeps
+    // the join key (asana_task_id ?? email) consistent between Step 2 and Step 3.
+    const emailToContact = new Map<string, ContactInfo>();
+
+    // Derives the canonical join key for a contact, used by both the opener
+    // map (Step 2) and the per-contact results (Step 3) so they always agree.
+    const contactKey = (c: ContactInfo) => c.asana_task_id ?? c.email;
 
     for (const line of sendLines) {
       const event = JSON.parse(line) as {
         email?: string;
         messageId?: string;
-        transactionalData?: string;
+        // Iterable may serialize this as a JSON string or return it already
+        // parsed as an object, depending on the export, so accept both.
+        transactionalData?: string | Record<string, unknown>;
       };
       if (!event.messageId || !event.email) continue;
 
       const contact: ContactInfo = { email: event.email.toLowerCase() };
 
-      if (event.transactionalData) {
-        try {
-          const td = JSON.parse(event.transactionalData) as Record<string, string>;
-          if (td.asana_task_id) contact.asana_task_id = td.asana_task_id;
-          if (td.business_name) contact.business_name = td.business_name;
-          if (td.client_name) contact.client_name = td.client_name;
-        } catch { /* ignore parse errors */ }
+      const td = parseTransactionalData(event.transactionalData);
+      if (td) {
+        if (typeof td.asana_task_id === "string") contact.asana_task_id = td.asana_task_id;
+        if (typeof td.business_name === "string") contact.business_name = td.business_name;
+        if (typeof td.client_name === "string") contact.client_name = td.client_name;
       }
 
       messageToContact.set(event.messageId, contact);
+      emailToContact.set(contact.email, contact);
     }
 
     // Step 2: fetch emailOpen events → join on messageId
@@ -390,11 +420,16 @@ server.tool(
       if (shouldExcludeBots && event.isBot) continue;
       if (!event.email) continue;
 
-      const contact = event.messageId
-        ? messageToContact.get(event.messageId)
-        : undefined;
+      // Prefer the messageId join, but fall back to matching the open's email
+      // against the sent contacts so we resolve the same asana_task_id-keyed
+      // contact that Step 3 will look up (avoids missing opens for contacts
+      // with an asana_task_id whose open event has a missing/unmatched messageId).
+      const emailLower = event.email.toLowerCase();
+      const contact =
+        (event.messageId ? messageToContact.get(event.messageId) : undefined) ??
+        emailToContact.get(emailLower);
 
-      const key = contact?.asana_task_id ?? event.email.toLowerCase();
+      const key = contact ? contactKey(contact) : emailLower;
       const existing = openerMap.get(key);
 
       if (existing) {
@@ -420,13 +455,12 @@ server.tool(
     const seen = new Set<string>();
     const uniqueContacts: ContactInfo[] = [];
     for (const c of allContacts) {
-      const key = c.asana_task_id ?? c.email;
+      const key = contactKey(c);
       if (!seen.has(key)) { seen.add(key); uniqueContacts.push(c); }
     }
 
     const results = uniqueContacts.map((c) => {
-      const key = c.asana_task_id ?? c.email;
-      const openStats = openerMap.get(key);
+      const openStats = openerMap.get(contactKey(c));
       return {
         asana_task_id: c.asana_task_id ?? null,
         email: c.email,
